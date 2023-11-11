@@ -16,7 +16,7 @@ maintenance = { status = "as-is" }
 
 [dependencies]
 reqwest = { version = "0.11.20", features = [ "brotli", "gzip", "deflate", "native-tls-alpn", "stream" ] }
-url = "2.4.0"
+url = { version = "2.4.0", features = ["serde"] }
 tokio = { version = "1.32.0", features = [ "rt-multi-thread", "macros", "time", "parking_lot" ] }
 tokio-stream = "0.1.14"
 hashbrown = { version = "0.14.0", default-features = true }
@@ -41,8 +41,14 @@ flexbuffers = { version = "2.0.0", optional = true }
 itertools = { version = "0.10.5", optional = true }
 case_insensitive_string = { version = "0.1.7", features = [ "compact", "serde" ]}
 jsdom = { version = "0.0.11-alpha.1", optional = true, features = [ "hashbrown", "tokio" ] }
-chromiumoxide_fork = { version = "0.5.12", optional = true, features = ["tokio-runtime", "bytes"], default-features = false }
+chromiumoxide = { version = "0.5.4", default-features = false, features = ["tokio-runtime"], optional = true }
 sitemap = { version = "0.4.1", optional = true }
+moka = { version = "0.12.1", features = ["async-trait", "async-lock", "future"] }
+async-once-cell = { version = "0.5.3", features = ["std"] }
+once_cell = "1.18.0"
+cowstr = { version = "1.2.0", features = ["serde"] }
+dashmap = { version = "5.5.3", features = ["serde"] }
+anyhow = "1.0.75"
 
 [target.'cfg(all(not(windows), not(target_os = "android"), not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { version = "0.5.0", optional = true }
@@ -64,8 +70,9 @@ full_resources = []
 socks = ["reqwest/socks"]
 sitemap = ["dep:sitemap"]
 js = ["dep:jsdom"]
-chrome = ["dep:chromiumoxide_fork"]
+chrome = ["dep:chromiumoxide"]
 chrome_headed = ["chrome"]
 chrome_cpu = ["chrome"]
 chrome_stealth = ["chrome"]
 budget = []
+all = ['chrome_headed', 'chrome']

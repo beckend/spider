@@ -788,7 +788,7 @@ impl Website {
         client: &Client,
         base: &(CompactString, smallvec::SmallVec<[CompactString; 2]>),
         _: bool,
-        page: &chromiumoxide_fork::Page,
+        page: &chromiumoxide::Page,
     ) -> HashSet<CaseInsensitiveString> {
         let links: HashSet<CaseInsensitiveString> = if self
             .is_allowed_default(&self.get_base_link(), &self.configuration.get_blacklist())
@@ -1061,15 +1061,7 @@ impl Website {
                     match browser.new_page("about:blank").await {
                         Ok(new_page) => {
                             if cfg!(feature = "chrome_stealth") {
-                                let _ = new_page.enable_stealth_mode(&if self
-                                    .configuration
-                                    .user_agent
-                                    .is_some()
-                                {
-                                    &self.configuration.user_agent.as_ref().unwrap().as_str()
-                                } else {
-                                    ""
-                                });
+                                let _ = new_page.enable_stealth_mode();
                             }
 
                             let shared = Arc::new((
@@ -1527,153 +1519,129 @@ impl Website {
 
     #[cfg(feature = "chrome")]
     /// Start to scape website concurrently and store html
-    async fn scrape_concurrent(&mut self, client: &Client, handle: &Option<Arc<AtomicI8>>) {
-        let selectors = get_page_selectors(
+    async fn scrape_concurrent(&mut self, _client: &Client, handle: &Option<Arc<AtomicI8>>) {
+        use crate::utils::get_uri_sanitized;
+        use tokio::sync::RwLock;
+
+        let Some((browser, _)) = launch_browser(&self.configuration.proxies).await else {
+            log("", "Chrome failed to start.");
+            return;
+        };
+
+        let Some(selectors) = get_page_selectors(
             &self.domain.inner(),
             self.configuration.subdomains,
             self.configuration.tld,
-        );
+        ) else {
+            log("", "Failed to get selectors.");
+            return;
+        };
 
-        if selectors.is_some() {
-            self.status = CrawlStatus::Active;
-            let blacklist_url = self.configuration.get_blacklist();
-            self.pages = Some(Box::new(Vec::new()));
-            let delay = self.configuration.delay;
-            let on_link_find_callback = self.on_link_find_callback;
-            let mut interval = tokio::time::interval(Duration::from_millis(10));
-            let selectors = Arc::new(unsafe { selectors.unwrap_unchecked() });
-            let throttle = Duration::from_millis(delay);
+        self.status = CrawlStatus::Active;
+        let blacklist_url = self.configuration.get_blacklist();
+        self.pages = Some(Box::new(Vec::new()));
+        let delay = self.configuration.delay;
+        let on_link_find_callback = self.on_link_find_callback;
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        let selectors = Arc::new(selectors);
+        let throttle = Duration::from_millis(delay);
 
-            let mut links: HashSet<CaseInsensitiveString> = HashSet::from([*self.domain.clone()]);
-            let mut set: JoinSet<(CaseInsensitiveString, Page, HashSet<CaseInsensitiveString>)> =
-                JoinSet::new();
+        let mut links: HashSet<CaseInsensitiveString> = HashSet::from([*self.domain.clone()]);
+        let mut set: JoinSet<(CaseInsensitiveString, Page, HashSet<CaseInsensitiveString>)> =
+            JoinSet::new();
 
-            match launch_browser(&self.configuration.proxies).await {
-                Some((mut browser, _)) => {
-                    match browser.new_page("about:blank").await {
-                        Ok(new_page) => {
-                            if cfg!(feature = "chrome_stealth") {
-                                let _ = new_page.enable_stealth_mode(&if self
-                                    .configuration
-                                    .user_agent
-                                    .is_some()
-                                {
-                                    &self.configuration.user_agent.as_ref().unwrap().as_str()
-                                } else {
-                                    ""
-                                });
-                            }
-                            let page = Arc::new(new_page.clone());
-                            // crawl while links exists
-                            loop {
-                                let stream = tokio_stream::iter::<HashSet<CaseInsensitiveString>>(
-                                    links.drain().collect(),
-                                )
-                                .throttle(throttle);
-                                tokio::pin!(stream);
+        let browser = Arc::new(RwLock::new(browser));
 
-                                while let Some(link) = stream.next().await {
-                                    match handle.as_ref() {
-                                        Some(handle) => {
-                                            while handle.load(Ordering::Relaxed) == 1 {
-                                                interval.tick().await;
-                                            }
-                                            if handle.load(Ordering::Relaxed) == 2 {
-                                                set.shutdown().await;
-                                                break;
-                                            }
-                                        }
-                                        None => (),
-                                    }
-                                    if !self.is_allowed(&link, &blacklist_url) {
-                                        continue;
-                                    }
-                                    self.links_visited.insert(link.clone());
-                                    log("fetch", &link);
-                                    let client = client.clone();
-                                    let permit = SEM.acquire().await.unwrap();
-                                    let channel = self.channel.clone();
-                                    let selectors = selectors.clone();
-                                    let page = page.clone();
-                                    let external_domains_caseless =
-                                        self.external_domains_caseless.clone();
+        // crawl while links exists
+        loop {
+            let stream =
+                tokio_stream::iter::<HashSet<CaseInsensitiveString>>(links.drain().collect())
+                    .throttle(throttle);
+            tokio::pin!(stream);
 
-                                    set.spawn(async move {
-                                        drop(permit);
-                                        let page = crate::utils::fetch_page_html_chrome(
-                                            &link.as_ref(),
-                                            &client,
-                                            &page,
-                                        )
-                                        .await;
-                                        let mut page = build(&link.as_ref(), page);
-
-                                        let (link, _) = match on_link_find_callback {
-                                            Some(cb) => {
-                                                let c = cb(link, Some(page.get_html()));
-
-                                                c
-                                            }
-                                            _ => (link, None),
-                                        };
-
-                                        match &channel {
-                                            Some(c) => {
-                                                match c.0.send(page.clone()) {
-                                                    _ => (),
-                                                };
-                                            }
-                                            _ => (),
-                                        };
-
-                                        page.set_external(external_domains_caseless);
-                                        let page_links = page.links(&*selectors).await;
-
-                                        (link, page, page_links)
-                                    });
-                                }
-
-                                task::yield_now().await;
-
-                                if links.capacity() >= 1500 {
-                                    links.shrink_to_fit();
-                                }
-
-                                while let Some(res) = set.join_next().await {
-                                    match res {
-                                        Ok(msg) => {
-                                            let page = msg.1;
-                                            links.extend(&msg.2 - &self.links_visited);
-                                            task::yield_now().await;
-                                            match self.pages.as_mut() {
-                                                Some(p) => p.push(page.clone()),
-                                                _ => (),
-                                            };
-                                        }
-                                        _ => (),
-                                    };
-                                }
-
-                                task::yield_now().await;
-                                if links.is_empty() {
-                                    break;
-                                }
-                            }
-
-                            self.status = CrawlStatus::Idle;
-
-                            if !std::env::var("CHROME_URL").is_ok() {
-                                let _ = browser.close().await;
-                            } else {
-                                let _ = new_page.close().await;
-                            }
+            while let Some(link) = stream.next().await {
+                match handle.as_ref() {
+                    Some(handle) => {
+                        while handle.load(Ordering::Relaxed) == 1 {
+                            interval.tick().await;
                         }
-                        _ => log("", "Chrome failed to open page."),
+                        if handle.load(Ordering::Relaxed) == 2 {
+                            set.shutdown().await;
+                            break;
+                        }
                     }
+                    None => (),
                 }
-                _ => log("", "Chrome failed to start."),
-            };
+                let link: CaseInsensitiveString = get_uri_sanitized(link.as_ref()).as_str().into();
+                if !self.is_allowed(&link, &blacklist_url) {
+                    continue;
+                }
+                self.links_visited.insert(link.clone());
+                log("fetch", &link);
+                let permit = SEM.acquire().await.unwrap();
+                let channel = self.channel.clone();
+                let selectors = selectors.clone();
+                let browser = browser.clone();
+                let external_domains_caseless = self.external_domains_caseless.clone();
+
+                set.spawn(async move {
+                    drop(permit);
+                    let page_contents =
+                        crate::utils::fetch_page_html_chrome(&link.as_ref(), browser).await;
+                    let mut page = build(&link.as_ref(), page_contents);
+                    let (link, _) = match on_link_find_callback {
+                        Some(cb) => {
+                            let c = cb(link, Some(page.get_html()));
+
+                            c
+                        }
+                        _ => (link, None),
+                    };
+
+                    match &channel {
+                        Some(c) => {
+                            match c.0.send(page.clone()) {
+                                _ => (),
+                            };
+                        }
+                        _ => (),
+                    };
+
+                    page.set_external(external_domains_caseless);
+                    let page_links = page.links(&*selectors).await;
+
+                    (link, page, page_links)
+                });
+            }
+
+            task::yield_now().await;
+
+            if links.capacity() >= 1500 {
+                links.shrink_to_fit();
+            }
+
+            while let Some(res) = set.join_next().await {
+                match res {
+                    Ok(msg) => {
+                        let page = msg.1;
+                        links.extend(&msg.2 - &self.links_visited);
+                        task::yield_now().await;
+                        match self.pages.as_mut() {
+                            Some(p) => p.push(page.clone()),
+                            _ => (),
+                        };
+                    }
+                    _ => (),
+                };
+            }
+
+            task::yield_now().await;
+            if links.is_empty() {
+                break;
+            }
         }
+
+        self.status = CrawlStatus::Idle;
     }
 
     /// Sitemap crawl entire lists. Note: this method does not re-crawl the links of the pages found on the sitemap.
